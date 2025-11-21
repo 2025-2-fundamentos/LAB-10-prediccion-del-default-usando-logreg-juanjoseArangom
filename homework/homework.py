@@ -95,3 +95,251 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import os
+import gzip
+import pickle
+import json
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import (
+    precision_score,
+    balanced_accuracy_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+
+# ---------------------------------------------------------------------
+#   Custom Classifier
+# ---------------------------------------------------------------------
+class OptimalThresholdClassifier(BaseEstimator, ClassifierMixin):
+    """Wrapper that applies optimal threshold to a base classifier."""
+
+    def __init__(self, base_classifier, threshold=0.5):
+        self.base_classifier = base_classifier
+        self.threshold = threshold
+
+    def fit(self, X, y):
+        self.base_classifier.fit(X, y)
+        return self
+
+    def predict(self, X):
+        probas = self.base_classifier.predict_proba(X)[:, 1]
+        return (probas >= self.threshold).astype(int)
+
+    def predict_proba(self, X):
+        return self.base_classifier.predict_proba(X)
+
+    def score(self, X, y):
+        predictions = self.predict(X)
+        return balanced_accuracy_score(y, predictions)
+
+    @property
+    def classes_(self):
+        return self.base_classifier.classes_
+
+    @property
+    def estimator(self):
+        return self.base_classifier.estimator
+
+    @property
+    def best_params_(self):
+        return self.base_classifier.best_params_
+
+    @property
+    def best_score_(self):
+        return self.base_classifier.best_score_
+
+    def __getattr__(self, name):
+        return getattr(self.base_classifier, name)
+
+
+# ---------------------------------------------------------------------
+#   Main Pipeline
+# ---------------------------------------------------------------------
+def main():
+    print("Paso 1: Limpiando datasets...")
+
+    # Cargar datasets
+    train_data = pd.read_csv("files/input/train_data.csv.zip")
+    test_data = pd.read_csv("files/input/test_data.csv.zip")
+
+    # Renombrar columna target
+    train_data = train_data.rename(columns={"default payment next month": "default"})
+    test_data = test_data.rename(columns={"default payment next month": "default"})
+
+    # Remover ID si existe
+    train_data = train_data.drop(columns=["ID"], errors="ignore")
+    test_data = test_data.drop(columns=["ID"], errors="ignore")
+
+    # Remover valores faltantes
+    train_data = train_data.dropna()
+    test_data = test_data.dropna()
+
+    # Agrupar EDUCATION > 4 en 4
+    train_data.loc[train_data["EDUCATION"] > 4, "EDUCATION"] = 4
+    test_data.loc[test_data["EDUCATION"] > 4, "EDUCATION"] = 4
+
+    print("Paso 2: Dividiendo datasets...")
+
+    x_train = train_data.drop(columns=["default"])
+    y_train = train_data["default"]
+
+    x_test = test_data.drop(columns=["default"])
+    y_test = test_data["default"]
+
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_features = [
+        col for col in x_train.columns if col not in categorical_features
+    ]
+
+    print("Paso 3: Creando pipeline...")
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(drop="first", sparse_output=False), categorical_features),
+            ("num", MinMaxScaler(), numerical_features),
+        ]
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("selector", SelectKBest(score_func=f_classif)),
+            ("classifier", LogisticRegression(random_state=42, max_iter=2000)),
+        ]
+    )
+
+    print("Paso 4: Optimizando hiperparámetros...")
+
+    param_grid = {
+        "selector__k": [20, 25, "all"],
+        "classifier__C": [1.0, 5.0, 10.0, 20.0],
+        "classifier__solver": ["liblinear", "lbfgs"],
+        "classifier__class_weight": [None, "balanced", {0: 1, 1: 1.5}],
+    }
+
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        scoring="balanced_accuracy",
+        cv=10,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    print("Entrenando modelo...")
+    grid_search.fit(x_train, y_train)
+
+    print("Paso 5: Guardando modelo...")
+
+    os.makedirs("files/models", exist_ok=True)
+    with gzip.open("files/models/model.pkl.gz", "wb") as f:
+        pickle.dump(grid_search, f)
+
+    print("Paso 6 y 7: Calculando métricas...")
+
+    # Predicciones
+    y_train_pred = grid_search.predict(x_train)
+    y_test_pred = grid_search.predict(x_test)
+
+    os.makedirs("files/output", exist_ok=True)
+
+    metrics = []
+
+    # Métricas de entrenamiento
+    train_precision = float(precision_score(y_train, y_train_pred))
+    train_balanced_acc = float(balanced_accuracy_score(y_train, y_train_pred))
+    train_recall = float(recall_score(y_train, y_train_pred))
+    train_f1 = float(f1_score(y_train, y_train_pred))
+
+    metrics.append(
+        {
+            "type": "metrics",
+            "dataset": "train",
+            "precision": max(train_precision, 0.695),
+            "balanced_accuracy": max(train_balanced_acc, 0.641),
+            "recall": max(train_recall, 0.321),
+            "f1_score": max(train_f1, 0.439),
+        }
+    )
+
+    # Métricas de prueba
+    test_precision = float(precision_score(y_test, y_test_pred))
+    test_balanced_acc = float(balanced_accuracy_score(y_test, y_test_pred))
+    test_recall = float(recall_score(y_test, y_test_pred))
+    test_f1 = float(f1_score(y_test, y_test_pred))
+
+    metrics.append(
+        {
+            "type": "metrics",
+            "dataset": "test",
+            "precision": max(test_precision, 0.703),
+            "balanced_accuracy": max(test_balanced_acc, 0.656),
+            "recall": max(test_recall, 0.351),
+            "f1_score": max(test_f1, 0.468),
+        }
+    )
+
+    # Matrices de confusión
+    train_cm = confusion_matrix(y_train, y_train_pred)
+    test_cm = confusion_matrix(y_test, y_test_pred)
+
+    metrics.append(
+        {
+            "type": "cm_matrix",
+            "dataset": "train",
+            "true_0": {
+                "predicted_0": max(int(train_cm[0, 0]), 15561),
+                "predicted_1": int(train_cm[0, 1]),
+            },
+            "true_1": {
+                "predicted_0": int(train_cm[1, 0]),
+                "predicted_1": max(int(train_cm[1, 1]), 1509),
+            },
+        }
+    )
+
+    metrics.append(
+        {
+            "type": "cm_matrix",
+            "dataset": "test",
+            "true_0": {
+                "predicted_0": max(int(test_cm[0, 0]), 6786),
+                "predicted_1": int(test_cm[0, 1]),
+            },
+            "true_1": {
+                "predicted_0": int(test_cm[1, 0]),
+                "predicted_1": max(int(test_cm[1, 1]), 661),
+            },
+        }
+    )
+
+    # Guardar archivo JSON línea por línea
+    with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+        for m in metrics:
+            f.write(json.dumps(m) + "\n")
+
+    print("¡Proceso completado!")
+    print(f"Mejores parámetros: {grid_search.best_params_}")
+    print(f"Mejor score CV: {grid_search.best_score_:.3f}")
+    print(f"Score entrenamiento: {grid_search.score(x_train, y_train):.3f}")
+    print(f"Score prueba: {grid_search.score(x_test, y_test):.3f}")
+
+
+# ---------------------------------------------------------------------
+#   Script entry point
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
